@@ -321,7 +321,9 @@ class GPCApp:
         mol_frame.grid(row=0, column=5, sticky='nw', padx=4, pady=2)
         ttk.Button(mol_frame, text="Add SMILES File", command=self.add_smiles_file).grid(row=0, column=0, padx=4)
         self.mol_overlay = tk.Canvas(root, width=300, height=200, bg=root['bg'], highlightthickness=0)
-        self.mol_overlay.place(relx=0.7, rely=0.3)
+        # Hide the overlay canvas until a molecule is actually added. Otherwise this
+        # empty canvas shows up as a mysterious rectangle in the middle of the UI.
+        self.mol_overlay.place_forget()
         self.molecule_widgets = []
 
         # ---------- Actions ----------
@@ -595,14 +597,28 @@ class GPCApp:
             try:
                 img = Draw.MolToImage(mol, size=(200, 150))
                 photo = ImageTk.PhotoImage(img)
-                DraggableMolecule(self.mol_overlay, image=photo, label=Chem.MolToSmiles(mol))
+                self._ensure_mol_overlay_visible()
+                draggable = DraggableMolecule(
+                    self.mol_overlay,
+                    image=photo,
+                    label=Chem.MolToSmiles(mol),
+                )
+                self.molecule_widgets.append(draggable)
                 self.add_molecule_to_axes(mol)
             except Exception:
                 lbl = tk.Label(self.mol_overlay, text=display_text or "Molecule", bg='white', bd=1, relief='solid')
-                DraggableMolecule(self.mol_overlay, widget=lbl, label=display_text)
+                self._ensure_mol_overlay_visible()
+                draggable = DraggableMolecule(self.mol_overlay, widget=lbl, label=display_text)
+                self.molecule_widgets.append(draggable)
         else:
             lbl = tk.Label(self.mol_overlay, text=display_text, bg='white', bd=1, relief='solid')
-            DraggableMolecule(self.mol_overlay, widget=lbl, label=display_text)
+            self._ensure_mol_overlay_visible()
+            draggable = DraggableMolecule(self.mol_overlay, widget=lbl, label=display_text)
+            self.molecule_widgets.append(draggable)
+
+    def _ensure_mol_overlay_visible(self):
+        if not self.mol_overlay.winfo_ismapped():
+            self.mol_overlay.place(relx=0.7, rely=0.3)
 
     def add_molecule_to_axes(self, mol):
         try:
