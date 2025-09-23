@@ -96,20 +96,45 @@ class GPCApp:
         root.geometry(f"{w}x{h}+{x}+{y}")
         root.minsize(900, 600)
 
+        self.main_pane = ttk.PanedWindow(root, orient='horizontal')
+        self.main_pane.pack(fill='both', expand=True)
+
+        self.left_panel = ttk.Frame(self.main_pane, width=280)
+        self.left_panel.pack_propagate(False)
+        self.main_pane.add(self.left_panel)
+
+        self.right_panel = ttk.Frame(self.main_pane)
+        self.main_pane.add(self.right_panel)
+        try:
+            self.main_pane.paneconfigure(self.left_panel, minsize=220, weight=0)
+            self.main_pane.paneconfigure(self.right_panel, weight=1)
+        except Exception:
+            pass
+
+        self._build_left_panel()
+
         # ---------- state ----------
         self.file_vars = {}
         self.file_labels = {}
         self.file_colors = {}
         self.legend_order = []
 
+        self.current_traces = {}
+        self._tree_point_lookup = {}
+        self._selected_point = None
+        self._data_reload_needed = True
+        self._watermark_artist = None
+
         self.gradient_var = tk.BooleanVar(value=False)
         self.inline_var = tk.BooleanVar(value=False)
         self.hide_x_var = tk.BooleanVar(value=False)
         self.hide_y_var = tk.BooleanVar(value=False)
         self.auto_legend = tk.BooleanVar(value=True)
+        self.watermark_var = tk.BooleanVar(value=False)
         self.show_title = tk.BooleanVar(value=False)
         self.custom_title_var = tk.StringVar(value="")
         self.normalize_var = tk.BooleanVar(value=True)
+        self.normalize_var.trace_add('write', lambda *args: self._trigger_reload_plot())
         self.xlabel_var = tk.StringVar(value="")
         self.ylabel_var = tk.StringVar(value="")
         self.axis_fontsize_var = tk.IntVar(value=10)
@@ -128,6 +153,7 @@ class GPCApp:
 
         # Smoothing (sigma)
         self.sigma_var = tk.DoubleVar(value=1.0)
+        self.sigma_var.trace_add('write', lambda *args: self._trigger_reload_plot())
 
         # NEW: math vs unicode scripts
         self.use_mathtext = tk.BooleanVar(value=True)  # OFF -> Unicode subs/sups so normal fonts (e.g., Calibri) apply
@@ -148,7 +174,7 @@ class GPCApp:
         self.auto_legend.trace_add("write", lambda *args: self._push_history())
 
         # ---------- top scroller ----------
-        container = ttk.Frame(root)
+        container = ttk.Frame(self.right_panel)
         container.pack(side='top', fill='x', padx=6, pady=4)
 
         h_canvas = tk.Canvas(container, height=220)
@@ -224,6 +250,7 @@ class GPCApp:
         ttk.Label(det_axis_frame, text="Detector:").grid(row=0, column=0, padx=2, sticky='e')
         self.detector_cb = ttk.Combobox(det_axis_frame, values=['RI','Light Scattering','Viscometry'], state='readonly', width=12)
         self.detector_cb.current(0); self.detector_cb.grid(row=0, column=1, padx=2)
+        self.detector_cb.bind('<<ComboboxSelected>>', self._trigger_reload_plot)
 
         ttk.Label(det_axis_frame, text="X-min:").grid(row=1, column=0, padx=2, sticky='e')
         self.xmin = ttk.Entry(det_axis_frame, width=6); self.xmin.insert(0,'0'); self.xmin.grid(row=1, column=1, padx=2)
@@ -264,7 +291,7 @@ class GPCApp:
         # Smoothing sigma
         ttk.Label(det_axis_frame, text="Smoothing σ:").grid(row=5, column=0, padx=2, sticky='e')
         self.sigma_spin = ttk.Spinbox(det_axis_frame, from_=0.0, to=10.0, increment=0.1,
-                                      textvariable=self.sigma_var, width=6, command=self.update_plot)
+                                      textvariable=self.sigma_var, width=6, command=self._trigger_reload_plot)
         self.sigma_spin.grid(row=5, column=1, padx=2, sticky='w')
 
         # ---------- Display Options ----------
@@ -286,6 +313,8 @@ class GPCApp:
         ttk.Entry(display_frame, textvariable=self.ylabel_var, width=15).grid(row=3, column=3, padx=2)
         ttk.Label(display_frame, text="Axis Font Size:").grid(row=4, column=0, padx=2, sticky='e')
         ttk.Spinbox(display_frame, from_=6, to=30, textvariable=self.axis_fontsize_var, width=5).grid(row=4, column=1, padx=2, sticky='w')
+        ttk.Checkbutton(display_frame, text="Watermark 'Dean'", variable=self.watermark_var,
+                        command=self.update_plot).grid(row=5, column=0, columnspan=4, padx=4, pady=(4, 0), sticky='w')
 
         # ---------- Molecules (optional overlay) ----------
         mol_frame = ttk.LabelFrame(top_inner, text="Molecules", padding=6)
@@ -306,15 +335,219 @@ class GPCApp:
 
         # ---------- Figure ----------
         self.fig, self.ax = plt.subplots()
-        self.canvas = FigureCanvasTkAgg(self.fig, master=root)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.right_panel)
         self.canvas.get_tk_widget().pack(side='top', fill='both', expand=True, padx=6, pady=4)
 
         if not self.legend_order:
             self.legend_order = [f for f in sorted(self.file_vars.keys()) if self.file_vars.get(f, tk.BooleanVar(value=False)).get()]
-        self._push_history()
+        self.require_data_reload()
         self.update_plot()
+        self._push_history()
 
     # ===== helpers =====
+    def _build_left_panel(self):
+        ttk.Label(self.left_panel, text="Selected Data").pack(anchor='w', padx=8, pady=(8, 0))
+
+        tree_frame = ttk.Frame(self.left_panel)
+        tree_frame.pack(fill='both', expand=True, padx=6, pady=(6, 3))
+
+        self.data_tree = ttk.Treeview(
+            tree_frame,
+            columns=("time", "value"),
+            show="tree headings",
+            selectmode="browse",
+        )
+        self.data_tree.heading("#0", text="Dataset", anchor='w')
+        self.data_tree.heading("time", text="Time", anchor='e')
+        self.data_tree.heading("value", text="Detector Output", anchor='e')
+        self.data_tree.column("#0", width=140, stretch=False)
+        self.data_tree.column("time", width=90, anchor='e')
+        self.data_tree.column("value", width=110, anchor='e')
+
+        tree_scroll_y = ttk.Scrollbar(tree_frame, orient='vertical', command=self.data_tree.yview)
+        tree_scroll_x = ttk.Scrollbar(tree_frame, orient='horizontal', command=self.data_tree.xview)
+        self.data_tree.configure(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.set)
+
+        self.data_tree.grid(row=0, column=0, sticky='nsew')
+        tree_scroll_y.grid(row=0, column=1, sticky='ns')
+        tree_scroll_x.grid(row=1, column=0, sticky='ew')
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        self.data_tree.bind("<<TreeviewSelect>>", self.on_tree_select)
+
+        edit_frame = ttk.LabelFrame(self.left_panel, text="Edit Value", padding=6)
+        edit_frame.pack(fill='x', padx=6, pady=(4, 8))
+
+        ttk.Label(edit_frame, text="Time:").grid(row=0, column=0, sticky='e', padx=4, pady=2)
+        self.edit_time_var = tk.StringVar()
+        self.edit_time_entry = ttk.Entry(edit_frame, textvariable=self.edit_time_var, width=14)
+        self.edit_time_entry.grid(row=0, column=1, sticky='we', padx=4, pady=2)
+
+        ttk.Label(edit_frame, text="Detector:").grid(row=1, column=0, sticky='e', padx=4, pady=2)
+        self.edit_value_var = tk.StringVar()
+        self.edit_value_entry = ttk.Entry(edit_frame, textvariable=self.edit_value_var, width=14)
+        self.edit_value_entry.grid(row=1, column=1, sticky='we', padx=4, pady=2)
+
+        btn_frame = ttk.Frame(edit_frame)
+        btn_frame.grid(row=2, column=0, columnspan=2, pady=(6, 0))
+        self.apply_edit_btn = ttk.Button(btn_frame, text="Apply", command=self.apply_edit)
+        self.apply_edit_btn.pack(side='left', padx=4)
+        self.reset_edit_btn = ttk.Button(btn_frame, text="Reset", command=self.reset_edit_fields)
+        self.reset_edit_btn.pack(side='left', padx=4)
+
+        edit_frame.columnconfigure(1, weight=1)
+
+        self._set_editing_state(False)
+
+    def _set_editing_state(self, enabled: bool):
+        state_entry = 'normal' if enabled else 'disabled'
+        for widget in (getattr(self, 'edit_time_entry', None), getattr(self, 'edit_value_entry', None)):
+            if widget is not None:
+                widget.configure(state=state_entry)
+        state_btn = tk.NORMAL if enabled else tk.DISABLED
+        for widget in (getattr(self, 'apply_edit_btn', None), getattr(self, 'reset_edit_btn', None)):
+            if widget is not None:
+                widget.configure(state=state_btn)
+        if not enabled:
+            self.edit_time_var.set("")
+            self.edit_value_var.set("")
+
+    @staticmethod
+    def _format_float(val):
+        try:
+            return f"{float(val):.6g}"
+        except Exception:
+            return ""
+
+    def _refresh_tree(self):
+        if not hasattr(self, 'data_tree'):
+            return
+
+        selected_point = self._selected_point
+        self.data_tree.delete(*self.data_tree.get_children())
+        self._tree_point_lookup = {}
+
+        ordered_files = [f for f in self.legend_order if f in self.current_traces]
+        remaining = [f for f in self.current_traces if f not in self.legend_order]
+        ordered_files.extend(sorted(remaining))
+
+        for file_idx, file_path in enumerate(ordered_files):
+            data = self.current_traces.get(file_path)
+            if not data:
+                continue
+            times = np.asarray(data.get("times", []), dtype=float)
+            values = np.asarray(data.get("vals", []), dtype=float)
+            file_iid = f"file_{file_idx}"
+            display_name = os.path.basename(file_path)
+            parent = self.data_tree.insert("", "end", iid=file_iid, text=display_name, values=("", ""))
+            for idx, (t_val, y_val) in enumerate(zip(times, values)):
+                child_iid = f"{file_iid}_row{idx}"
+                self._tree_point_lookup[child_iid] = (file_path, idx)
+                self.data_tree.insert(
+                    parent,
+                    "end",
+                    iid=child_iid,
+                    text=f"{idx}",
+                    values=(self._format_float(t_val), self._format_float(y_val)),
+                )
+
+        if selected_point:
+            for iid, point in self._tree_point_lookup.items():
+                if point == selected_point:
+                    self.data_tree.selection_set(iid)
+                    self.data_tree.focus(iid)
+                    self.data_tree.see(iid)
+                    self._populate_edit_fields(point)
+                    self._set_editing_state(True)
+                    break
+            else:
+                self._selected_point = None
+                self._set_editing_state(False)
+        else:
+            self._selected_point = None
+            self._set_editing_state(False)
+
+    def _populate_edit_fields(self, point):
+        if not point:
+            return
+        file_path, idx = point
+        data = self.current_traces.get(file_path)
+        if not data:
+            return
+        times = np.asarray(data.get("times", []), dtype=float)
+        values = np.asarray(data.get("vals", []), dtype=float)
+        if idx >= len(times) or idx >= len(values):
+            return
+        self.edit_time_var.set(self._format_float(times[idx]))
+        self.edit_value_var.set(self._format_float(values[idx]))
+
+    def on_tree_select(self, event=None):
+        sel = self.data_tree.selection()
+        if not sel:
+            self._selected_point = None
+            self._set_editing_state(False)
+            return
+        item = sel[0]
+        point = self._tree_point_lookup.get(item)
+        if not point:
+            self._selected_point = None
+            self._set_editing_state(False)
+            return
+        self._selected_point = point
+        self._populate_edit_fields(point)
+        self._set_editing_state(True)
+
+    def reset_edit_fields(self):
+        if not self._selected_point:
+            self._set_editing_state(False)
+            return
+        self._populate_edit_fields(self._selected_point)
+
+    def apply_edit(self):
+        if not self._selected_point:
+            messagebox.showinfo("No selection", "Select a data point to edit.")
+            return
+        file_path, idx = self._selected_point
+        data = self.current_traces.get(file_path)
+        if not data:
+            messagebox.showwarning("Unavailable", "Selected trace is no longer loaded.")
+            self._refresh_tree()
+            return
+        try:
+            new_time = float(self.edit_time_var.get())
+            new_val = float(self.edit_value_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid value", "Enter numeric values for time and detector output.")
+            return
+
+        if not (np.isfinite(new_time) and np.isfinite(new_val)):
+            messagebox.showerror("Invalid value", "Values must be finite numbers.")
+            return
+
+        times = np.asarray(data.get("times", []), dtype=float)
+        values = np.asarray(data.get("vals", []), dtype=float)
+        if idx >= len(times) or idx >= len(values):
+            messagebox.showwarning("Out of range", "Selected row is no longer available.")
+            self._refresh_tree()
+            return
+
+        times[idx] = new_time
+        values[idx] = new_val
+        data["times"] = times
+        data["vals"] = values
+        self.current_traces[file_path] = data
+        self._data_reload_needed = False
+        self._push_history()
+        self.update_plot(reload=False)
+
+    def require_data_reload(self):
+        self._data_reload_needed = True
+
+    def _trigger_reload_plot(self, *_):
+        self.require_data_reload()
+        self.update_plot()
+
     def toggle_baseline(self):
         self.extend_baseline_var.set(not self.extend_baseline_var.get())
         self.baseline_toggle_btn.config(text=f"Baseline: {'On' if self.extend_baseline_var.get() else 'Off'}")
@@ -382,12 +615,21 @@ class GPCApp:
             print(f"[DEBUG] Failed to add molecule to axes: {e}")
 
     def _capture_state(self):
+        traces = {}
+        for path, data in self.current_traces.items():
+            times = np.asarray(data.get("times", []), dtype=float).tolist()
+            vals = np.asarray(data.get("vals", []), dtype=float).tolist()
+            traces[path] = {"times": times, "vals": vals}
+
         return {
             "show_title": self.show_title.get(),
             "custom_title": self.custom_title_var.get(),
             "auto_legend": self.auto_legend.get(),
             "legend_loc": self.legend_loc_cb.get() if hasattr(self, 'legend_loc_cb') else 'best',
             "legend_font": self.legend_font.get() if hasattr(self, 'legend_font') else '10',
+            "legend_order": list(self.legend_order),
+            "current_traces": traces,
+            "selected_point": self._selected_point,
         }
 
     def _apply_state(self, state):
@@ -397,6 +639,23 @@ class GPCApp:
         self.legend_loc_cb.set(state.get("legend_loc", "best"))
         self.legend_font.delete(0, tk.END)
         self.legend_font.insert(0, state.get("legend_font", "10"))
+
+        restored = {}
+        for path, payload in state.get("current_traces", {}).items():
+            if path not in self.file_vars:
+                continue
+            restored[path] = {
+                "times": np.asarray(payload.get("times", []), dtype=float),
+                "vals": np.asarray(payload.get("vals", []), dtype=float),
+            }
+        self.current_traces = restored
+
+        new_order = [f for f in state.get("legend_order", self.legend_order) if f in self.file_vars]
+        if new_order:
+            self.legend_order = new_order
+
+        self._selected_point = state.get("selected_point")
+        self._refresh_tree()
 
     def _push_history(self):
         if self._hist_index < len(self._history) - 1:
@@ -409,14 +668,16 @@ class GPCApp:
             return
         self._hist_index -= 1
         self._apply_state(self._history[self._hist_index])
-        self.update_plot()
+        self._data_reload_needed = False
+        self.update_plot(reload=False)
 
     def redo(self):
         if self._hist_index >= len(self._history) - 1:
             return
         self._hist_index += 1
         self._apply_state(self._history[self._hist_index])
-        self.update_plot()
+        self._data_reload_needed = False
+        self.update_plot(reload=False)
 
     def browse_folder(self):
         d = filedialog.askdirectory(title="Select folder with data")
@@ -449,6 +710,9 @@ class GPCApp:
             existing_order = [f for f in self.legend_order if f in self.file_vars]
             new_items = [f for f in sorted(self.file_vars.keys()) if f not in existing_order and self.file_vars[f].get()]
             self.legend_order = existing_order + new_items
+        self.current_traces = {f: data for f, data in self.current_traces.items() if f in self.file_vars}
+        self._selected_point = None
+        self.require_data_reload()
         self.update_plot()
 
     # ---- helper for cosine taper ----
@@ -504,16 +768,30 @@ class GPCApp:
         else:
             return self._to_unicode_scripts(base)
 
-    def update_plot(self):
+    def update_plot(self, reload=None):
         self.ax.clear()
         self._legend_handles = []
         self._legend_labels = []
+
+        if self._watermark_artist is not None:
+            try:
+                self._watermark_artist.remove()
+            except Exception:
+                pass
+            self._watermark_artist = None
 
         detector = self.detector_cb.get()
         xmin = float(self.xmin.get()) if self.xmin.get() else None
         xmax = float(self.xmax.get()) if self.xmax.get() else None
         sigma = float(self.sigma_var.get())
         fontname = self.font_family_var.get()
+
+        reload_data = self._data_reload_needed if reload is None else reload
+        self._data_reload_needed = False
+
+        missing = [f for f, var in self.file_vars.items() if var.get() and f not in self.legend_order]
+        if missing:
+            self.legend_order.extend(missing)
 
         # --- Force Calibri-first everywhere, with sane fallbacks ---
         # Try to pin the exact Calibri font file if available
@@ -540,18 +818,30 @@ class GPCApp:
         # -------- Load traces & bounds
         traces = []
         data_min, data_max = None, None
+        new_traces = {}
 
         for f in self.legend_order:
             var = self.file_vars.get(f)
             if not var or not var.get():
                 continue
-            times, vals = load_and_smooth(f, detector, sigma=sigma)
-            if times is None or len(times) == 0:
-                continue
-            if self.normalize_var.get():
-                maxv = vals.max() if len(vals) else 1.0
-                if maxv != 0:
-                    vals = vals / maxv
+            if reload_data or f not in self.current_traces:
+                times, vals = load_and_smooth(f, detector, sigma=sigma)
+                if times is None or len(times) == 0:
+                    continue
+                times = np.asarray(times, dtype=float)
+                vals = np.asarray(vals, dtype=float)
+                if self.normalize_var.get():
+                    maxv = vals.max() if len(vals) else 1.0
+                    if maxv != 0:
+                        vals = vals / maxv
+            else:
+                cached = self.current_traces.get(f)
+                times = np.asarray(cached.get("times", []), dtype=float)
+                vals = np.asarray(cached.get("vals", []), dtype=float)
+                if times.size == 0 or vals.size == 0:
+                    continue
+
+            new_traces[f] = {"times": times.copy(), "vals": vals.copy()}
             label_raw = self.file_labels.get(f, f)
             label = self._auto_mathify(label_raw)
             traces.append({"times": times, "vals": vals,
@@ -560,6 +850,9 @@ class GPCApp:
             tmin = float(times.min()); tmax = float(times.max())
             data_min = tmin if data_min is None else min(data_min, tmin)
             data_max = tmax if data_max is None else max(data_max, tmax)
+
+        self.current_traces = new_traces
+        self._refresh_tree()
 
         if not traces:
             self.canvas.draw()
@@ -672,6 +965,23 @@ class GPCApp:
             self.ax.set_title(self._auto_mathify(custom) if custom else title_base, fontproperties=fp_main)
         else:
             self.ax.set_title("")
+
+        if self.watermark_var.get():
+            try:
+                fontsize = max(24, int(self.axis_fontsize_var.get()) * 3)
+            except Exception:
+                fontsize = 36
+            self._watermark_artist = self.fig.text(
+                0.5, 0.5, "Dean",
+                fontsize=fontsize,
+                color="gray",
+                alpha=0.15,
+                ha="center",
+                va="center",
+                rotation=30,
+                weight="bold",
+                transform=self.fig.transFigure,
+            )
 
         self.canvas.draw()
 
@@ -812,6 +1122,7 @@ class GPCApp:
                 "custom_title": self.custom_title_var.get(),
                 "hide_x": self.hide_x_var.get(),
                 "hide_y": self.hide_y_var.get(),
+                "watermark": self.watermark_var.get(),
             }
 
             fp = filedialog.asksaveasfilename(
@@ -893,7 +1204,9 @@ class GPCApp:
 
             self.hide_x_var.set(bool(state.get("hide_x", False)))
             self.hide_y_var.set(bool(state.get("hide_y", False)))
+            self.watermark_var.set(bool(state.get("watermark", False)))
 
+            self.require_data_reload()
             self.update_plot()
             messagebox.showinfo("Loaded", f"Session loaded from:\n{fp}")
         except Exception as e:
