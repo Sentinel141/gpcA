@@ -541,26 +541,44 @@ class GPCApp:
         # -------- Load traces & bounds
         traces = []
         data_min, data_max = None, None
+        min_positive_mass = None
 
         for f in self.legend_order:
             var = self.file_vars.get(f)
             if not var or not var.get():
                 continue
-            times, vals = load_and_smooth(f, detector, sigma=sigma)
-            if times is None or len(times) == 0:
+            masses, vals = load_and_smooth(f, detector, sigma=sigma)
+            if masses is None or len(masses) == 0:
                 continue
+            masses = np.asarray(masses, dtype=float)
+            vals = np.asarray(vals, dtype=float)
+
+            mask = np.isfinite(masses) & np.isfinite(vals) & (masses > 0)
+            if not mask.any():
+                continue
+
+            masses = masses[mask]
+            vals = np.clip(vals[mask], 0.0, None)
+
+            order = np.argsort(masses)
+            masses = masses[order]
+            vals = vals[order]
+
             if self.normalize_var.get():
-                maxv = vals.max() if len(vals) else 1.0
-                if maxv != 0:
+                masses, vals = compute_weight_fraction(masses, vals)
+            elif len(vals):
+                maxv = vals.max()
+                if maxv > 0:
                     vals = vals / maxv
             label_raw = self.file_labels.get(f, f)
             label = self._auto_mathify(label_raw)
-            traces.append({"times": times, "vals": vals,
+            traces.append({"times": masses, "vals": vals,
                            "label": label, "color": self.file_colors.get(f, None)})
 
-            tmin = float(times.min()); tmax = float(times.max())
+            tmin = float(masses.min()); tmax = float(masses.max())
             data_min = tmin if data_min is None else min(data_min, tmin)
             data_max = tmax if data_max is None else max(data_max, tmax)
+            min_positive_mass = tmin if min_positive_mass is None else min(min_positive_mass, tmin)
 
         if not traces:
             self.canvas.draw()
@@ -585,13 +603,30 @@ class GPCApp:
             x_left_final = xmin
             x_right_final = xmax
 
+        positive_floor = None
+        if min_positive_mass is not None:
+            positive_floor = max(min_positive_mass * 0.5, 1e-6)
+
+        if x_left_final is not None and x_left_final <= 0:
+            x_left_final = positive_floor if positive_floor is not None else None
+        if x_right_final is not None and x_right_final <= 0:
+            x_right_final = None
+
         # -------- Plot each trace with optional taper+baseline
         taper_on = self.taper_var.get()
         taper_len = max(0.0, float(self.taper_len_var.get() or 0.0))
 
         for tr in traces:
-            times = tr["times"]; vals = tr["vals"]
+            times = np.asarray(tr["times"], dtype=float)
+            vals = np.asarray(tr["vals"], dtype=float)
             label = tr["label"]; color = tr["color"]
+
+            mask = np.isfinite(times) & np.isfinite(vals) & (times > 0)
+            if not mask.any():
+                continue
+
+            times = times[mask]
+            vals = vals[mask]
 
             if not self.extend_baseline_var.get():
                 line, = self.ax.plot(times, vals, color=color)
@@ -634,10 +669,35 @@ class GPCApp:
             if x_right_final is not None and right_zero_start < x_right_final:
                 xplot.extend([right_zero_start, x_right_final]); yplot.extend([0.0, 0.0])
 
-            line, = self.ax.plot(xplot, yplot, color=color)
+            xplot_arr = np.asarray(xplot, dtype=float)
+            yplot_arr = np.asarray(yplot, dtype=float)
+            mask_plot = xplot_arr > 0
+            if not mask_plot.any():
+                continue
+
+            xplot_arr = xplot_arr[mask_plot]
+            yplot_arr = yplot_arr[mask_plot]
+
+            line, = self.ax.plot(xplot_arr, yplot_arr, color=color)
             line.set_label(label)
             self._legend_handles.append(line)
             self._legend_labels.append(label)
+
+        # Configure logarithmic molar-mass axis and typical SEC styling
+        self.ax.set_xscale('log')
+        xticks = [1e3, 1e4, 1e5]
+        self.ax.set_xticks(xticks)
+
+        def _log_tick_formatter(x, pos):
+            if x <= 0:
+                return ""
+            exp = np.log10(x)
+            if abs(exp - round(exp)) < 1e-6:
+                return rf"$10^{{{int(round(exp))}}}$"
+            return f"{x:g}"
+
+        self.ax.xaxis.set_major_formatter(FuncFormatter(_log_tick_formatter))
+        self.ax.set_ylim(bottom=0)
 
         # ----- Cosmetics & axes
         if self.hide_x_var.get():
@@ -664,12 +724,14 @@ class GPCApp:
 
         if x_left_final is not None or x_right_final is not None:
             self.ax.set_xlim(left=x_left_final, right=x_right_final)
+            if self.ax.get_xscale() == 'log':
+                self.ax.set_xticks(xticks)
 
         if self.show_title.get():
             custom = self.custom_title_var.get().strip()
             title_base = f"Detector: {detector} (σ={sigma:.1f})"
             if self.normalize_var.get():
-                title_base += " (normalized)"
+                title_base += " (w(logM))"
             self.ax.set_title(self._auto_mathify(custom) if custom else title_base, fontproperties=fp_main)
         else:
             self.ax.set_title("")
