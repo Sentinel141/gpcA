@@ -1,0 +1,190 @@
+diff a/Mtest.py b/Mtest.py	(rejected hunks)
+@@ -1,139 +1,171 @@
+ import os
+ import re
+ import json
+ import tkinter as tk
+ from tkinter import filedialog, messagebox, colorchooser
+ import tkinter.ttk as ttk
+ import numpy as np
+ import pandas as pd
+ import matplotlib as mpl
+-import matplotlib.pyplot as plt
+-from matplotlib import font_manager as fm
+-from matplotlib.font_manager import FontProperties
+-from scipy.ndimage import gaussian_filter1d
+-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+-from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+-from PIL import Image, ImageTk
++import matplotlib.pyplot as plt
++from matplotlib import font_manager as fm
++from matplotlib.font_manager import FontProperties
++from scipy.ndimage import gaussian_filter1d
++from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
++from matplotlib.offsetbox import OffsetImage, AnnotationBbox
++from PIL import Image, ImageTk
++from matplotlib.ticker import FuncFormatter
+ 
+ # RDKit support for SMILES rendering (optional)
+ try:
+     from rdkit import Chem
+     from rdkit.Chem import Draw
+     RDKit_AVAILABLE = True
+ except ImportError:
+     RDKit_AVAILABLE = False
+ 
+ 
+ class DraggableMolecule:
+     def __init__(self, parent_canvas, image=None, widget=None, label=""):
+         self.parent = parent_canvas
+         self.label = label
+         if image is not None:
+             self.id = parent_canvas.create_image(10, 10, anchor='nw', image=image)
+             self.image = image
+         else:
+             self.id = parent_canvas.create_window(10, 10, anchor='nw', window=widget)
+             self.widget = widget
+         self._drag_data = {"x": 0, "y": 0}
+         parent_canvas.tag_bind(self.id, "<ButtonPress-1>", self.on_press)
+         parent_canvas.tag_bind(self.id, "<ButtonRelease-1>", self.on_release)
+         parent_canvas.tag_bind(self.id, "<B1-Motion>", self.on_motion)
+ 
+     def on_press(self, event):
+         self._drag_data["x"] = event.x
+         self._drag_data["y"] = event.y
+ 
+     def on_motion(self, event):
+         dx = event.x - self._drag_data["x"]
+         dy = event.y - self._drag_data["y"]
+         self.parent.move(self.id, dx, dy)
+         self._drag_data["x"] = event.x
+         self._drag_data["y"] = event.y
+ 
+     def on_release(self, event):
+         pass
+ 
+ 
+-def load_and_smooth(path, detector, sigma=1):
++def load_and_smooth(path, detector, sigma=1):
+     """
+     Reads GPC text/CSV with at least 4 columns:
+     Time, RI, Light Scattering, Viscometry.
+     Accepts space/tab or CSV. Smooths chosen detector.
+     """
+     try:
+         try:
+             df = pd.read_csv(path, delim_whitespace=True, header=None)
+         except Exception:
+             df = pd.read_csv(path, header=None)
+     except Exception:
+         return None, None
+ 
+     if df.shape[1] < 4:
+         return None, None
+ 
+     df = df.iloc[:, :4]
+     df.columns = ['Time', 'RI', 'Light Scattering', 'Viscometry']
+     ser = pd.to_numeric(df[detector], errors='coerce')
+     times = pd.to_numeric(df['Time'], errors='coerce')
+     valid = ser.notna() & times.notna()
+     if not valid.any():
+         return None, None
+-    smoothed = gaussian_filter1d(ser[valid].to_numpy(), sigma=sigma)
+-    return times[valid].to_numpy(), smoothed
+-
+-
+-class GPCApp:
+-    def __init__(self, root):
++    smoothed = gaussian_filter1d(ser[valid].to_numpy(), sigma=sigma)
++    return times[valid].to_numpy(), smoothed
++
++
++def compute_weight_fraction(masses, signal):
++    """Return masses and weight fraction w(log10 M) for positive masses."""
++    masses = np.asarray(masses, dtype=float)
++    signal = np.asarray(signal, dtype=float)
++
++    mask = np.isfinite(masses) & np.isfinite(signal) & (masses > 0)
++    if not mask.any():
++        return np.array([]), np.array([])
++
++    masses = masses[mask]
++    signal = np.clip(signal[mask], 0.0, None)
++
++    order = np.argsort(masses)
++    masses = masses[order]
++    signal = signal[order]
++
++    if masses.size < 2:
++        if signal.size and signal.max() > 0:
++            return masses, signal / signal.max()
++        return masses, signal
++
++    log_m = np.log10(masses)
++    area = np.trapz(signal, log_m)
++    if area > 0:
++        weights = signal / area
++    else:
++        peak = signal.max()
++        weights = signal / peak if peak > 0 else signal
++    return masses, weights
++
++
++class GPCApp:
++    def __init__(self, root):
+         self.root = root
+         root.title("GPC Analyzer Live Viewer")
+ 
+         screen_w = root.winfo_screenwidth()
+         screen_h = root.winfo_screenheight()
+         w = min(1200, int(screen_w * 0.9))
+         h = min(800, int(screen_h * 0.9))
+         x = (screen_w - w) // 2
+         y = (screen_h - h) // 2
+         root.geometry(f"{w}x{h}+{x}+{y}")
+         root.minsize(900, 600)
+ 
+         # ---------- state ----------
+         self.file_vars = {}
+         self.file_labels = {}
+         self.file_colors = {}
+         self.legend_order = []
+ 
+         self.gradient_var = tk.BooleanVar(value=False)
+         self.inline_var = tk.BooleanVar(value=False)
+         self.hide_x_var = tk.BooleanVar(value=False)
+         self.hide_y_var = tk.BooleanVar(value=False)
+         self.auto_legend = tk.BooleanVar(value=True)
+         self.show_title = tk.BooleanVar(value=False)
+         self.custom_title_var = tk.StringVar(value="")
+-        self.normalize_var = tk.BooleanVar(value=True)
+-        self.xlabel_var = tk.StringVar(value="")
+-        self.ylabel_var = tk.StringVar(value="")
++        self.normalize_var = tk.BooleanVar(value=True)
++        self.xlabel_var = tk.StringVar(value="Molar mass [g/mol]")
++        self.ylabel_var = tk.StringVar(value="Weight Fraction w(logM)")
+         self.axis_fontsize_var = tk.IntVar(value=10)
+         self.font_family_var = tk.StringVar(value="DejaVu Sans")
+         self.gradient_start_color = "#000000"
+         self.gradient_end_color = "#FFFFFF"
+ 
+         # Baseline controls
+         self.extend_baseline_var = tk.BooleanVar(value=True)
+         self.baseline_len_var = tk.DoubleVar(value=2.0)
+         self.baseline_mode = tk.StringVar(value="X-limits")
+ 
+         # Taper controls
+         self.taper_var = tk.BooleanVar(value=True)
+         self.taper_len_var = tk.DoubleVar(value=0.3)
+ 
+         # Smoothing (sigma)
+         self.sigma_var = tk.DoubleVar(value=1.0)
+ 
+         # NEW: math vs unicode scripts
+         self.use_mathtext = tk.BooleanVar(value=True)  # OFF -> Unicode subs/sups so normal fonts (e.g., Calibri) apply
+ 
+         # undo/redo history (minimal)
+         self._history = []
+         self._hist_index = -1
+ 
+         # ---------- shortcuts ----------

@@ -1,0 +1,532 @@
+diff --git a/Mtest.py b/Mtest.py
+index ca023634ef555fcd9d453c1718ab765114559ede..2ece35ccf11778e9cba0838ab9965164e50ec5af 100644
+--- a/Mtest.py
++++ b/Mtest.py
+@@ -1,139 +1,171 @@
+ import os
+ import re
+ import json
+ import tkinter as tk
+ from tkinter import filedialog, messagebox, colorchooser
+ import tkinter.ttk as ttk
+ import numpy as np
+ import pandas as pd
+ import matplotlib as mpl
+-import matplotlib.pyplot as plt
+-from matplotlib import font_manager as fm
+-from matplotlib.font_manager import FontProperties
+-from scipy.ndimage import gaussian_filter1d
+-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+-from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+-from PIL import Image, ImageTk
++import matplotlib.pyplot as plt
++from matplotlib import font_manager as fm
++from matplotlib.font_manager import FontProperties
++from scipy.ndimage import gaussian_filter1d
++from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
++from matplotlib.offsetbox import OffsetImage, AnnotationBbox
++from PIL import Image, ImageTk
++from matplotlib.ticker import FuncFormatter
+ 
+ # RDKit support for SMILES rendering (optional)
+ try:
+     from rdkit import Chem
+     from rdkit.Chem import Draw
+     RDKit_AVAILABLE = True
+ except ImportError:
+     RDKit_AVAILABLE = False
+ 
+ 
+ class DraggableMolecule:
+     def __init__(self, parent_canvas, image=None, widget=None, label=""):
+         self.parent = parent_canvas
+         self.label = label
+         if image is not None:
+             self.id = parent_canvas.create_image(10, 10, anchor='nw', image=image)
+             self.image = image
+         else:
+             self.id = parent_canvas.create_window(10, 10, anchor='nw', window=widget)
+             self.widget = widget
+         self._drag_data = {"x": 0, "y": 0}
+         parent_canvas.tag_bind(self.id, "<ButtonPress-1>", self.on_press)
+         parent_canvas.tag_bind(self.id, "<ButtonRelease-1>", self.on_release)
+         parent_canvas.tag_bind(self.id, "<B1-Motion>", self.on_motion)
+ 
+     def on_press(self, event):
+         self._drag_data["x"] = event.x
+         self._drag_data["y"] = event.y
+ 
+     def on_motion(self, event):
+         dx = event.x - self._drag_data["x"]
+         dy = event.y - self._drag_data["y"]
+         self.parent.move(self.id, dx, dy)
+         self._drag_data["x"] = event.x
+         self._drag_data["y"] = event.y
+ 
+     def on_release(self, event):
+         pass
+ 
+ 
+-def load_and_smooth(path, detector, sigma=1):
++def load_and_smooth(path, detector, sigma=1):
+     """
+     Reads GPC text/CSV with at least 4 columns:
+     Time, RI, Light Scattering, Viscometry.
+     Accepts space/tab or CSV. Smooths chosen detector.
+     """
+     try:
+         try:
+             df = pd.read_csv(path, delim_whitespace=True, header=None)
+         except Exception:
+             df = pd.read_csv(path, header=None)
+     except Exception:
+         return None, None
+ 
+     if df.shape[1] < 4:
+         return None, None
+ 
+     df = df.iloc[:, :4]
+     df.columns = ['Time', 'RI', 'Light Scattering', 'Viscometry']
+     ser = pd.to_numeric(df[detector], errors='coerce')
+     times = pd.to_numeric(df['Time'], errors='coerce')
+     valid = ser.notna() & times.notna()
+     if not valid.any():
+         return None, None
+-    smoothed = gaussian_filter1d(ser[valid].to_numpy(), sigma=sigma)
+-    return times[valid].to_numpy(), smoothed
+-
+-
+-class GPCApp:
+-    def __init__(self, root):
++    smoothed = gaussian_filter1d(ser[valid].to_numpy(), sigma=sigma)
++    return times[valid].to_numpy(), smoothed
++
++
++def compute_weight_fraction(masses, signal):
++    """Return masses and weight fraction w(logM) for positive masses."""
++    masses = np.asarray(masses, dtype=float)
++    signal = np.asarray(signal, dtype=float)
++
++    mask = np.isfinite(masses) & np.isfinite(signal) & (masses > 0)
++    if not mask.any():
++        return np.array([]), np.array([])
++
++    masses = masses[mask]
++    signal = np.clip(signal[mask], 0.0, None)
++
++    order = np.argsort(masses)
++    masses = masses[order]
++    signal = signal[order]
++
++    if masses.size < 2:
++        if signal.size and signal.max() > 0:
++            return masses, signal / signal.max()
++        return masses, signal
++
++    log_m = np.log(masses)
++    area = np.trapz(signal, log_m)
++    if area > 0:
++        weights = signal / area
++    else:
++        peak = signal.max()
++        weights = signal / peak if peak > 0 else signal
++    return masses, weights
++
++
++class GPCApp:
++    def __init__(self, root):
+         self.root = root
+         root.title("GPC Analyzer Live Viewer")
+ 
+         screen_w = root.winfo_screenwidth()
+         screen_h = root.winfo_screenheight()
+         w = min(1200, int(screen_w * 0.9))
+         h = min(800, int(screen_h * 0.9))
+         x = (screen_w - w) // 2
+         y = (screen_h - h) // 2
+         root.geometry(f"{w}x{h}+{x}+{y}")
+         root.minsize(900, 600)
+ 
+         # ---------- state ----------
+         self.file_vars = {}
+         self.file_labels = {}
+         self.file_colors = {}
+         self.legend_order = []
+ 
+         self.gradient_var = tk.BooleanVar(value=False)
+         self.inline_var = tk.BooleanVar(value=False)
+         self.hide_x_var = tk.BooleanVar(value=False)
+         self.hide_y_var = tk.BooleanVar(value=False)
+         self.auto_legend = tk.BooleanVar(value=True)
+         self.show_title = tk.BooleanVar(value=False)
+         self.custom_title_var = tk.StringVar(value="")
+-        self.normalize_var = tk.BooleanVar(value=True)
+-        self.xlabel_var = tk.StringVar(value="")
+-        self.ylabel_var = tk.StringVar(value="")
++        self.normalize_var = tk.BooleanVar(value=True)
++        self.xlabel_var = tk.StringVar(value="Molar mass [g/mol]")
++        self.ylabel_var = tk.StringVar(value="Weight Fraction w(logM)")
+         self.axis_fontsize_var = tk.IntVar(value=10)
+         self.font_family_var = tk.StringVar(value="DejaVu Sans")
+         self.gradient_start_color = "#000000"
+         self.gradient_end_color = "#FFFFFF"
+ 
+         # Baseline controls
+         self.extend_baseline_var = tk.BooleanVar(value=True)
+         self.baseline_len_var = tk.DoubleVar(value=2.0)
+         self.baseline_mode = tk.StringVar(value="X-limits")
+ 
+         # Taper controls
+         self.taper_var = tk.BooleanVar(value=True)
+         self.taper_len_var = tk.DoubleVar(value=0.3)
+ 
+         # Smoothing (sigma)
+         self.sigma_var = tk.DoubleVar(value=1.0)
+ 
+         # NEW: math vs unicode scripts
+         self.use_mathtext = tk.BooleanVar(value=True)  # OFF -> Unicode subs/sups so normal fonts (e.g., Calibri) apply
+ 
+         # undo/redo history (minimal)
+         self._history = []
+         self._hist_index = -1
+ 
+         # ---------- shortcuts ----------
+diff --git a/Mtest.py b/Mtest.py
+index ca023634ef555fcd9d453c1718ab765114559ede..2ece35ccf11778e9cba0838ab9965164e50ec5af 100644
+--- a/Mtest.py
++++ b/Mtest.py
+@@ -516,181 +548,243 @@ class GPCApp:
+         fontname = self.font_family_var.get()
+ 
+         # --- Force Calibri-first everywhere, with sane fallbacks ---
+         # Try to pin the exact Calibri font file if available
+         try:
+             cal_path = fm.findfont(FontProperties(family=fontname, style='normal', weight='normal'),
+                                    fallback_to_default=False)
+             use_fname = os.path.basename(cal_path).lower().startswith('calibri')
+         except Exception:
+             cal_path = None
+             use_fname = False
+ 
+         mpl.rcParams['font.family'] = [fontname, 'Segoe UI Symbol', 'DejaVu Sans']
+         mpl.rcParams['font.style'] = 'normal'
+         mpl.rcParams['text.usetex'] = False
+         mpl.rcParams['mathtext.default'] = 'regular'
+ 
+         if use_fname and os.path.exists(cal_path):
+             fp_main = FontProperties(fname=cal_path, size=self.axis_fontsize_var.get(),
+                                      style='normal', weight='normal')
+         else:
+             fp_main = FontProperties(family=[fontname, 'Segoe UI Symbol', 'DejaVu Sans'],
+                                      size=self.axis_fontsize_var.get(), style='normal', weight='normal')
+ 
+         # -------- Load traces & bounds
+-        traces = []
+-        data_min, data_max = None, None
+-
+-        for f in self.legend_order:
+-            var = self.file_vars.get(f)
+-            if not var or not var.get():
+-                continue
+-            times, vals = load_and_smooth(f, detector, sigma=sigma)
+-            if times is None or len(times) == 0:
+-                continue
+-            if self.normalize_var.get():
+-                maxv = vals.max() if len(vals) else 1.0
+-                if maxv != 0:
+-                    vals = vals / maxv
+-            label_raw = self.file_labels.get(f, f)
+-            label = self._auto_mathify(label_raw)
+-            traces.append({"times": times, "vals": vals,
+-                           "label": label, "color": self.file_colors.get(f, None)})
+-
+-            tmin = float(times.min()); tmax = float(times.max())
+-            data_min = tmin if data_min is None else min(data_min, tmin)
+-            data_max = tmax if data_max is None else max(data_max, tmax)
++        traces = []
++        data_min, data_max = None, None
++        min_positive_mass = None
++
++        for f in self.legend_order:
++            var = self.file_vars.get(f)
++            if not var or not var.get():
++                continue
++            masses, vals = load_and_smooth(f, detector, sigma=sigma)
++            if masses is None or len(masses) == 0:
++                continue
++            masses = np.asarray(masses, dtype=float)
++            vals = np.asarray(vals, dtype=float)
++
++            mask = np.isfinite(masses) & np.isfinite(vals) & (masses > 0)
++            if not mask.any():
++                continue
++
++            masses = masses[mask]
++            vals = np.clip(vals[mask], 0.0, None)
++
++            order = np.argsort(masses)
++            masses = masses[order]
++            vals = vals[order]
++
++            if self.normalize_var.get():
++                masses, vals = compute_weight_fraction(masses, vals)
++            elif len(vals):
++                maxv = vals.max()
++                if maxv > 0:
++                    vals = vals / maxv
++            label_raw = self.file_labels.get(f, f)
++            label = self._auto_mathify(label_raw)
++            traces.append({"times": masses, "vals": vals,
++                           "label": label, "color": self.file_colors.get(f, None)})
++
++            tmin = float(masses.min()); tmax = float(masses.max())
++            data_min = tmin if data_min is None else min(data_min, tmin)
++            data_max = tmax if data_max is None else max(data_max, tmax)
++            min_positive_mass = tmin if min_positive_mass is None else min(min_positive_mass, tmin)
+ 
+         if not traces:
+             self.canvas.draw()
+             return
+ 
+         # -------- Reference span & extension
+         if self.baseline_mode.get() == "X-limits":
+             ref_left  = xmin if xmin is not None else data_min
+             ref_right = xmax if xmax is not None else data_max
+         else:
+             ref_left, ref_right = data_min, data_max
+         if ref_right < ref_left:
+             ref_left, ref_right = ref_right, ref_left
+ 
+         ext = float(self.baseline_len_var.get() or 0.0)
+         ext_left, ext_right = ref_left - ext, ref_right + ext
+ 
+-        if self.extend_baseline_var.get():
+-            x_left_final = xmin if xmin is not None else ext_left
+-            x_right_final = xmax if xmax is not None else ext_right
+-        else:
+-            x_left_final = xmin
+-            x_right_final = xmax
++        if self.extend_baseline_var.get():
++            x_left_final = xmin if xmin is not None else ext_left
++            x_right_final = xmax if xmax is not None else ext_right
++        else:
++            x_left_final = xmin
++            x_right_final = xmax
++
++        positive_floor = None
++        if min_positive_mass is not None:
++            positive_floor = max(min_positive_mass * 0.5, 1e-6)
++
++        if x_left_final is not None and x_left_final <= 0:
++            x_left_final = positive_floor if positive_floor is not None else None
++        if x_right_final is not None and x_right_final <= 0:
++            x_right_final = None
+ 
+         # -------- Plot each trace with optional taper+baseline
+         taper_on = self.taper_var.get()
+         taper_len = max(0.0, float(self.taper_len_var.get() or 0.0))
+ 
+-        for tr in traces:
+-            times = tr["times"]; vals = tr["vals"]
+-            label = tr["label"]; color = tr["color"]
+-
+-            if not self.extend_baseline_var.get():
+-                line, = self.ax.plot(times, vals, color=color)
+-                line.set_label(label)
+-                self._legend_handles.append(line)
+-                self._legend_labels.append(label)
+-                continue
+-
+-            left_data = float(times.min())
+-            right_data = float(times.max())
+-            y_left = float(vals[0])
+-            y_right = float(vals[-1])
+-
+-            xplot = []
+-            yplot = []
+-
+-            left_taper = min(taper_len, max(0.0, left_data - (x_left_final if x_left_final is not None else left_data))) if taper_on else 0.0
+-            left_zero_end = left_data - left_taper
+-
+-            if x_left_final is not None and x_left_final < left_zero_end:
+-                xplot.extend([x_left_final, left_zero_end]); yplot.extend([0.0, 0.0])
+-
+-            if left_taper > 0:
+-                xs, ys = self._cos_taper(left_zero_end, 0.0, left_data, y_left)
+-                if xs and xplot and xs[0] == xplot[-1]:
+-                    xs = xs[1:]; ys = ys[1:]
+-                xplot.extend(xs); yplot.extend(ys)
+-
+-            xplot.extend(times.tolist()); yplot.extend(vals.tolist())
+-
+-            right_taper = min(taper_len, max(0.0, (x_right_final if x_right_final is not None else right_data) - right_data)) if taper_on else 0.0
+-            right_zero_start = right_data + right_taper
+-
+-            if right_taper > 0:
+-                xs, ys = self._cos_taper(right_data, y_right, right_zero_start, 0.0)
+-                if xs and xplot and xs[0] == xplot[-1]:
+-                    xs = xs[1:]; ys = ys[1:]
+-                xplot.extend(xs); yplot.extend(ys)
+-
+-            if x_right_final is not None and right_zero_start < x_right_final:
+-                xplot.extend([right_zero_start, x_right_final]); yplot.extend([0.0, 0.0])
+-
+-            line, = self.ax.plot(xplot, yplot, color=color)
+-            line.set_label(label)
+-            self._legend_handles.append(line)
+-            self._legend_labels.append(label)
+-
+-        # ----- Cosmetics & axes
+-        if self.hide_x_var.get():
+-            self.ax.get_xaxis().set_visible(False)
+-        if self.hide_y_var.get():
+-            self.ax.get_yaxis().set_visible(False)
++        for tr in traces:
++            times = np.asarray(tr["times"], dtype=float)
++            vals = np.asarray(tr["vals"], dtype=float)
++            label = tr["label"]; color = tr["color"]
++
++            mask = np.isfinite(times) & np.isfinite(vals) & (times > 0)
++            if not mask.any():
++                continue
++
++            times = times[mask]
++            vals = vals[mask]
++
++            if not self.extend_baseline_var.get():
++                line, = self.ax.plot(times, vals, color=color)
++                line.set_label(label)
++                self._legend_handles.append(line)
++                self._legend_labels.append(label)
++                continue
++
++            left_data = float(times.min())
++            right_data = float(times.max())
++            y_left = float(vals[0])
++            y_right = float(vals[-1])
++
++            xplot = []
++            yplot = []
++
++            left_taper = min(taper_len, max(0.0, left_data - (x_left_final if x_left_final is not None else left_data))) if taper_on else 0.0
++            left_zero_end = left_data - left_taper
++
++            if x_left_final is not None and x_left_final < left_zero_end:
++                xplot.extend([x_left_final, left_zero_end]); yplot.extend([0.0, 0.0])
++
++            if left_taper > 0:
++                xs, ys = self._cos_taper(left_zero_end, 0.0, left_data, y_left)
++                if xs and xplot and xs[0] == xplot[-1]:
++                    xs = xs[1:]; ys = ys[1:]
++                xplot.extend(xs); yplot.extend(ys)
++
++            xplot.extend(times.tolist()); yplot.extend(vals.tolist())
++
++            right_taper = min(taper_len, max(0.0, (x_right_final if x_right_final is not None else right_data) - right_data)) if taper_on else 0.0
++            right_zero_start = right_data + right_taper
++
++            if right_taper > 0:
++                xs, ys = self._cos_taper(right_data, y_right, right_zero_start, 0.0)
++                if xs and xplot and xs[0] == xplot[-1]:
++                    xs = xs[1:]; ys = ys[1:]
++                xplot.extend(xs); yplot.extend(ys)
++
++            if x_right_final is not None and right_zero_start < x_right_final:
++                xplot.extend([right_zero_start, x_right_final]); yplot.extend([0.0, 0.0])
++
++            xplot_arr = np.asarray(xplot, dtype=float)
++            yplot_arr = np.asarray(yplot, dtype=float)
++            mask_plot = xplot_arr > 0
++            if not mask_plot.any():
++                continue
++
++            xplot_arr = xplot_arr[mask_plot]
++            yplot_arr = yplot_arr[mask_plot]
++
++            line, = self.ax.plot(xplot_arr, yplot_arr, color=color)
++            line.set_label(label)
++            self._legend_handles.append(line)
++            self._legend_labels.append(label)
++
++        # Configure logarithmic molar-mass axis and typical SEC styling
++        self.ax.set_xscale('log')
++        xticks = [1e3, 1e4, 1e5]
++        self.ax.set_xticks(xticks)
++
++        def _log_tick_formatter(x, pos):
++            if x <= 0:
++                return ""
++            exp = np.log10(x)
++            if abs(exp - round(exp)) < 1e-6:
++                return rf"$10^{{{int(round(exp))}}}$"
++            return f"{x:g}"
++
++        self.ax.xaxis.set_major_formatter(FuncFormatter(_log_tick_formatter))
++        self.ax.set_ylim(bottom=0)
++
++        # ----- Cosmetics & axes
++        if self.hide_x_var.get():
++            self.ax.get_xaxis().set_visible(False)
++        if self.hide_y_var.get():
++            self.ax.get_yaxis().set_visible(False)
+ 
+         xlabel = self._auto_mathify(self.xlabel_var.get().strip())
+         ylabel = self._auto_mathify(self.ylabel_var.get().strip())
+         self.ax.set_xlabel(xlabel if xlabel else "", fontproperties=fp_main)
+         self.ax.set_ylabel(ylabel if ylabel else "", fontproperties=fp_main)
+ 
+         for lbl in self.ax.get_xticklabels() + self.ax.get_yticklabels():
+             lbl.set_fontproperties(fp_main)
+ 
+         if self.inline_var.get():
+             for line, label in zip(self._legend_handles, self._legend_labels):
+                 xdata = line.get_xdata(); ydata = line.get_ydata()
+                 if len(xdata) and len(ydata):
+                     self.ax.text(xdata[-1], ydata[-1], label, fontproperties=fp_main)
+ 
+         if self.auto_legend.get():
+             self._apply_legend()
+ 
+-        if x_left_final is not None or x_right_final is not None:
+-            self.ax.set_xlim(left=x_left_final, right=x_right_final)
+-
+-        if self.show_title.get():
+-            custom = self.custom_title_var.get().strip()
+-            title_base = f"Detector: {detector} (σ={sigma:.1f})"
+-            if self.normalize_var.get():
+-                title_base += " (normalized)"
++        if x_left_final is not None or x_right_final is not None:
++            self.ax.set_xlim(left=x_left_final, right=x_right_final)
++            if self.ax.get_xscale() == 'log':
++                self.ax.set_xticks(xticks)
++
++        if self.show_title.get():
++            custom = self.custom_title_var.get().strip()
++            title_base = f"Detector: {detector} (σ={sigma:.1f})"
++            if self.normalize_var.get():
++                title_base += " (w(logM))"
+             self.ax.set_title(self._auto_mathify(custom) if custom else title_base, fontproperties=fp_main)
+         else:
+             self.ax.set_title("")
+ 
+         self.canvas.draw()
+ 
+     def _apply_legend(self):
+         legend_fontsize = float(self.legend_font.get()) if self.legend_font.get() else 10
+         if self.ax.get_legend():
+             self.ax.get_legend().remove()
+ 
+         # Mirror the same font logic used in update_plot, but with legend size
+         try:
+             cal_path = fm.findfont(FontProperties(family=self.font_family_var.get(),
+                                                   style='normal', weight='normal'),
+                                    fallback_to_default=False)
+             use_fname = os.path.basename(cal_path).lower().startswith('calibri')
+         except Exception:
+             cal_path = None
+             use_fname = False
+ 
+         if use_fname and os.path.exists(cal_path):
+             fp_leg = FontProperties(fname=cal_path, size=legend_fontsize,
+                                     style='normal', weight='normal')
+         else:
